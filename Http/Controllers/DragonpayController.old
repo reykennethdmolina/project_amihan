@@ -1,0 +1,207 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Models\OrderTransaction;
+use App\Models\Order;
+use App\Models\OrderItem;
+use App\Models\PreOrderTransaction;
+use App\Models\PreOrder;
+use App\Models\PreOrderItem;
+use App\Models\User;
+use App\Mail\OrderConfirmationEmail;
+use App\Mail\MerchantOrderListEmail;
+use App\Mail\PreOrderConfirmationEmail;
+use App\Mail\MerchantPreOrderListEmail;
+
+use Carbon\Carbon;
+use Dragonpay;
+use Mail;
+
+class DragonpayController extends Controller
+{
+    /* Postback URL */
+    public function handle(Dragonpay $client, Request $request)
+    {
+        $params = [
+            'transactionId'   => $request['txnid'],
+            'referenceNumber' => $request['refno'],
+            'status'          => $request['status'],
+            'message'         => $request['message'],
+            'digest'          => $request['digest']
+        ];
+
+        $transaction = Dragonpay::transactionIsValid($params);
+
+        if ($transaction) {
+            
+            $trans = OrderTransaction::where('id', $params['transactionId'])
+                ->where('payment_status', 'P')
+                ->firstOrFail();
+
+            if ($params['status'] == 'S') {
+                $datetime = Carbon::now();
+                $trans->update(['payment_date' => $datetime, 'payment_status' => 'S', 'refNo' => $params['referenceNumber']]);
+                $trans->orders()->update(['status' => 'A']);
+                $orderIds = $trans->orders()->pluck('id');
+                OrderItem::whereIn('order_id', $orderIds)->update(['status' => 'A']);
+
+                $this->sendEmail($trans->id);
+                
+            } else {
+                $trans->update(['refNo' => $params['referenceNumber']]);    
+            }
+            // /**  Pre Order Transaction */
+            // if ($params['transactionId'] >= 200000) {
+            //     $trans = PreOrderTransaction::where('id', $params['transactionId'])
+            //         ->where('payment_status', 'P')
+            //         ->firstOrFail();
+
+            //     if ($params['status'] == 'S') {
+            //         $datetime = Carbon::now();
+            //         $trans->update(['payment_date' => $datetime, 'payment_status' => 'S', 'refNo' => $params['referenceNumber']]);
+            //         $trans->preOrders()->update(['status' => 'A']);
+            //         $orderIds = $trans->preOrders()->pluck('id');
+            //         PreOrderItem::whereIn('pre_order_id', $orderIds)->update(['status' => 'A']);
+    
+            //         $this->sendPreOrderEmail($trans->id);
+                    
+            //     } else {
+            //         $trans->update(['refNo' => $params['referenceNumber']]);    
+            //     }
+
+            // } else {
+            //     $trans = OrderTransaction::where('id', $params['transactionId'])
+            //         ->where('payment_status', 'P')
+            //         ->firstOrFail();
+
+            //     if ($params['status'] == 'S') {
+            //         $datetime = Carbon::now();
+            //         $trans->update(['payment_date' => $datetime, 'payment_status' => 'S', 'refNo' => $params['referenceNumber']]);
+            //         $trans->orders()->update(['status' => 'A']);
+            //         $orderIds = $trans->orders()->pluck('id');
+            //         OrderItem::whereIn('order_id', $orderIds)->update(['status' => 'A']);
+    
+            //         $this->sendEmail($trans->id);
+                    
+            //     } else {
+            //         $trans->update(['refNo' => $params['referenceNumber']]);    
+            //     }
+            // }
+            
+        }
+        return $transaction ? 'result=OK' : 'result=FAIL_DIGEST_MISMATCH';
+    }
+
+    /** Sample https://www.agronegosyo.com/dragonpay/return?txnid=6106&refno=RVFVLTP4&status=S&message=%5b000%5d+BOG+Reference+No%3a+20181226190944+%23RVFVLTP4&digest=3aaecc596fe92fefb25e379503ae52e81f616b28 */
+    /* Return URL */
+    public function return(Request $request)
+    {
+        $status = $request['status'];
+
+        if ($status == 'S') {
+            return view('errors.payment-success');
+        } elseif ($status == 'F') {
+            return view('errors.payment-failed');
+        } elseif ($status == 'P') {
+            return view('errors.payment-pending');
+        } else {
+            return view('errors.payment-error');
+        }
+    }
+
+    public function sendEmail($transId) 
+    {
+        $transaction = OrderTransaction::where('id', $transId)
+            ->where('payment_status', 'S')
+            ->firstOrFail();
+
+        $orders = Order::where('order_transaction_id', $transaction->id)
+            ->where('buyer_id', $transaction->buyer_id)
+            ->where('status', '!=' ,'P')
+            ->pluck('id');
+
+        /* Email Buyer Order Transaction */
+        $buyer = User::where('id', $transaction->buyer_id)->first();
+        $items = OrderItem::whereIn('order_id', $orders)
+            ->where('status', '!=' ,'P')
+            ->get();
+        Mail::to($buyer->email)->send(new OrderConfirmationEmail($buyer, $items));
+
+        /* Email Seller Order Transaction */
+        $merchantOrders = Order::select('id', 'seller_id', 'buyer_id', 'status', 'shippingOption', 'handling_status')
+            ->where('order_transaction_id', $transaction->id)
+            ->where('buyer_id', $transaction->buyer_id)
+            ->where('status', '!=' ,'P')
+            ->with(array('seller' => function($query) {
+                $query->select(['id', 'firstname', 'lastname', 'mobile', 'email'])
+                    ->with(array('profile' => function($query) {
+                        $query->select(['user_id', 'business_email', 'business_name']);
+                }));    
+            }))
+            ->get();
+
+        foreach ($merchantOrders as $data) {
+            /* Loop Order per merchants */
+            $items = OrderItem::where('order_id', $data->id)
+                ->where('buyer_id', $transaction->buyer_id)
+                ->where('status', '!=' ,'P')
+                ->get();
+            Mail::to($data->seller->email)
+                ->cc($data->seller->profile->business_email)
+                ->send(new MerchantOrderListEmail($data, $items));   
+        }
+
+        return $transaction;
+    }
+
+    public function sendPreOrderEmail($transId) 
+    {
+        $transaction = PreOrderTransaction::where('id', $transId)
+            ->where('payment_status', 'S')
+            ->firstOrFail();
+
+        $orders = PreOrder::where('pre_order_transaction_id', $transaction->id)
+            ->where('buyer_id', $transaction->buyer_id)
+            ->where('status', '!=' ,'P')
+            ->pluck('id');
+
+        /* Email Buyer Order Transaction */
+        $buyer = User::where('id', $transaction->buyer_id)->first();
+        $items = PreOrderItem::whereIn('pre_order_id', $orders)
+            ->where('status', '!=' ,'P')
+            ->get();
+        Mail::to($buyer->email)->send(new PreOrderConfirmationEmail($buyer, $items));
+
+        /* Email Seller Order Transaction */
+        $merchantOrders = PreOrder::select('id', 'seller_id', 'buyer_id', 'status', 'shippingOption', 'handling_status')
+            ->where('pre_order_transaction_id', $transaction->id)
+            ->where('buyer_id', $transaction->buyer_id)
+            ->where('status', '!=' ,'P')
+            ->with(array('seller' => function($query) {
+                $query->select(['id', 'firstname', 'lastname', 'mobile', 'email'])
+                    ->with(array('profile' => function($query) {
+                        $query->select(['user_id', 'business_email', 'business_name']);
+                }));    
+            }))
+            ->get();
+
+        foreach ($merchantOrders as $data) {
+            /* Loop Order per merchants */
+            $items = PreOrderItem::where('pre_order_id', $data->id)
+                ->where('buyer_id', $transaction->buyer_id)
+                ->where('status', '!=' ,'P')
+                ->get();
+            Mail::to($data->seller->email)
+                ->cc($data->seller->profile->business_email)
+                ->send(new MerchantPreOrderListEmail($data, $items));   
+        }
+
+        return $transaction;
+    }
+
+    public function test() {
+        return view('errors.test');
+    }
+}
